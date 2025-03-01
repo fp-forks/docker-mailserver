@@ -2,161 +2,225 @@
 title: 'Tutorials | Basic Installation'
 ---
 
-## Building a Simple Mailserver
+## A Basic Example With Relevant Environmental Variables
 
-!!! warning
-    Adding the docker network's gateway to the list of trusted hosts, e.g. using the `network` or `connected-networks` option, can create an [**open relay**](https://en.wikipedia.org/wiki/Open_mail_relay), for instance [if IPv6 is enabled on the host machine but not in Docker][github-issue-1405-comment].
+This example provides you only with a basic example of what a minimal setup could look like. We **strongly recommend** that you go through the configuration file yourself and adjust everything to your needs. The default [compose.yaml](https://github.com/docker-mailserver/docker-mailserver/blob/master/compose.yaml) can be used for the purpose out-of-the-box, see the [_Usage_ chapter](../../usage.md).
 
-We are going to use this docker based mailserver:
+``` YAML
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: mailserver
+    # Provide the FQDN of your mail server here (Your DNS MX record should point to this value)
+    hostname: mail.example.com
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      - ./docker-data/dms/config/:/tmp/docker-mailserver/
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - ENABLE_RSPAMD=1
+      - ENABLE_CLAMAV=1
+      - ENABLE_FAIL2BAN=1
+    cap_add:
+      - NET_ADMIN # For Fail2Ban to work
+    restart: always
+```
 
-- First create a directory for the mailserver and get the setup script:
+## A Basic LDAP Setup
 
-    ```sh
-    mkdir -p /var/ds/mail.example.org
-    cd /var/ds/mail.example.org/
+**Note** There are currently no LDAP maintainers. If you encounter issues, please raise them in the issue tracker, but be aware that the core maintainers team will most likely not be able to help you. **We would appreciate and we encourage everyone to actively participate in maintaining LDAP-related code by becoming a maintainer!**
 
-    curl -o setup.sh \
-        https://raw.githubusercontent.com/docker-mailserver/docker-mailserver/master/setup.sh
-    chmod a+x ./setup.sh
-    ```
+``` YAML
+services:
+  mailserver:
+    image: ghcr.io/docker-mailserver/docker-mailserver:latest
+    container_name: mailserver
+    # Provide the FQDN of your mail server here (Your DNS MX record should point to this value)
+    hostname: mail.example.com
+    ports:
+      - "25:25"
+      - "465:465"
+      - "587:587"
+      - "993:993"
+    volumes:
+      - ./docker-data/dms/mail-data/:/var/mail/
+      - ./docker-data/dms/mail-state/:/var/mail-state/
+      - ./docker-data/dms/mail-logs/:/var/log/mail/
+      - ./docker-data/dms/config/:/tmp/docker-mailserver/
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - ACCOUNT_PROVISIONER=LDAP
+      - LDAP_SERVER_HOST=ldap # your ldap container/IP/ServerName
+      - LDAP_SEARCH_BASE=ou=people,dc=localhost,dc=localdomain
+      - LDAP_BIND_DN=cn=admin,dc=localhost,dc=localdomain
+      - LDAP_BIND_PW=admin
+      - LDAP_QUERY_FILTER_USER=(&(mail=%s)(mailEnabled=TRUE))
+      - LDAP_QUERY_FILTER_GROUP=(&(mailGroupMember=%s)(mailEnabled=TRUE))
+      - LDAP_QUERY_FILTER_ALIAS=(|(&(mailAlias=%s)(objectClass=PostfixBookMailForward))(&(mailAlias=%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE)))
+      - LDAP_QUERY_FILTER_DOMAIN=(|(&(mail=*@%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE))(&(mailGroupMember=*@%s)(objectClass=PostfixBookMailAccount)(mailEnabled=TRUE))(&(mailalias=*@%s)(objectClass=PostfixBookMailForward)))
+      - DOVECOT_PASS_FILTER=(&(objectClass=PostfixBookMailAccount)(uniqueIdentifier=%n))
+      - DOVECOT_USER_FILTER=(&(objectClass=PostfixBookMailAccount)(uniqueIdentifier=%n))
+      - ENABLE_SASLAUTHD=1
+      - SASLAUTHD_MECHANISMS=ldap
+      - SASLAUTHD_LDAP_SERVER=ldap
+      - SASLAUTHD_LDAP_BIND_DN=cn=admin,dc=localhost,dc=localdomain
+      - SASLAUTHD_LDAP_PASSWORD=admin
+      - SASLAUTHD_LDAP_SEARCH_BASE=ou=people,dc=localhost,dc=localdomain
+      - SASLAUTHD_LDAP_FILTER=(&(objectClass=PostfixBookMailAccount)(uniqueIdentifier=%U))
+      - POSTMASTER_ADDRESS=postmaster@localhost.localdomain
+    restart: always
+```
 
-- Create the file `docker-compose.yml` with a content like this:
+## Using DMS as a local mail relay for containers
+
+!!! info
+
+    This was originally a community contributed guide. Please let us know via a Github Issue if you're having any difficulty following the guide so that we can update it.
+
+This guide is focused on only using [SMTP ports (not POP3 and IMAP)][docs-ports] with the intent to relay mail received from another service to an external email address (eg: `user@gmail.com`). It is not intended for mailbox storage of real users.
+
+In this setup DMS is not intended to receive email from the outside world, so no anti-spam or anti-virus software is needed, making the service lighter to run.
+
+!!! tip "`setup`"
+
+    The `setup` command used below is to be [run inside the container][docs-usage].
+
+!!! warning "Open Relays"
+
+    Adding the docker network's gateway to the list of trusted hosts (_eg: using the `network` or `connected-networks` option_), can create an [**open relay**](https://en.wikipedia.org/wiki/Open_mail_relay). For instance [if IPv6 is enabled on the host machine, but not in Docker][github-issue-1405-comment].
+
+1. Create the file `compose.yaml` with a content like this:
 
     !!! example
 
         ```yaml
-        version: '2'
-
         services:
-        mail:
-            image: mailserver/docker-mailserver:latest
-            hostname: mail
-            domainname: example.org
-            container_name: mail
+          mailserver:
+            image: ghcr.io/docker-mailserver/docker-mailserver:latest
+            container_name: mailserver
+            # Provide the FQDN of your mail server here (Your DNS MX record should point to this value)
+            hostname: mail.example.com
             ports:
-            - "25:25"
-            - "587:587"
-            - "465:465"
+              - "25:25"
+              - "587:587"
+              - "465:465"
             volumes:
-            - ./data/:/var/mail/
-            - ./state/:/var/mail-state/
-            - ./config/:/tmp/docker-mailserver/
-            - /var/ds/wsproxy/letsencrypt/:/etc/letsencrypt/
+              - ./docker-data/dms/mail-data/:/var/mail/
+              - ./docker-data/dms/mail-state/:/var/mail-state/
+              - ./docker-data/dms/mail-logs/:/var/log/mail/
+              - ./docker-data/dms/config/:/tmp/docker-mailserver/
+              - /etc/localtime:/etc/localtime:ro
             environment:
-            - PERMIT_DOCKER=network
-            - SSL_TYPE=letsencrypt
-            - ONE_DIR=1
-            - DMS_DEBUG=1
-            - SPOOF_PROTECTION=0
-            - REPORT_RECIPIENT=1
-            - ENABLE_SPAMASSASSIN=0
-            - ENABLE_CLAMAV=0
-            - ENABLE_FAIL2BAN=1
-            - ENABLE_POSTGREY=0
+              - ENABLE_FAIL2BAN=1
+              # Using letsencrypt for SSL/TLS certificates:
+              - SSL_TYPE=letsencrypt
+              # Allow sending emails from other docker containers:
+              # Beware creating an Open Relay: https://docker-mailserver.github.io/docker-mailserver/latest/config/environment/#permit_docker
+              - PERMIT_DOCKER=network
+              # You may want to enable this: https://docker-mailserver.github.io/docker-mailserver/latest/config/environment/#spoof_protection
+              # See step 6 below, which demonstrates setup with enabled/disabled SPOOF_PROTECTION:
+              - SPOOF_PROTECTION=0
             cap_add:
-            - NET_ADMIN
-            - SYS_PTRACE
+              - NET_ADMIN # For Fail2Ban to work
+            restart: always
         ```
 
-    For more details about the environment variables that can be used, and their meaning and possible values, check also these:
+    The docs have a detailed page on [Environment Variables][docs-environment] for reference.
 
-    - [Environment Variables][docs-environment]
-    - [`mailserver.env` file][github-file-dotenv]
+    ??? tip "Firewalled ports"
 
-    Make sure to set the proper `domainname` that you will use for the emails. We forward only SMTP ports (not POP3 and IMAP) because we are not interested in accessing the mailserver directly (from a client).  We also use these settings:
+        If you have a firewall running, you may need to open ports `25`, `587` and `465`.
 
-    - `PERMIT_DOCKER=network` because we want to send emails from other docker containers.
-    - `SSL_TYPE=letsencrypt` because we will manage SSL certificates with letsencrypt.
+        For example, with the firewall `ufw`, run:
 
-- We need to open ports `25`, `587` and `465` on the firewall:
+        ```sh
+        ufw allow 25
+        ufw allow 587
+        ufw allow 465
+        ```
 
-    ```sh
-    ufw allow 25
-    ufw allow 587
-    ufw allow 465
-    ```
+        **Caution:** This may [not be sound advice][github-issue-ufw].
 
-    On your server you may have to do it differently.
+2. Configure your DNS service to use an MX record for the _hostname_ (eg: `mail`) you configured in the previous step and add the [SPF][docs-spf] TXT record.
 
-- Pull the docker image: `docker pull mailserver/docker-mailserver:latest`
+    !!! tip "If you manually manage the DNS zone file for the domain"
 
-- Now generate the DKIM keys with `./setup.sh config dkim` and copy the content of the file `config/opendkim/keys/domain.tld/mail.txt` on the domain zone configuration at the DNS server. I use [bind9](https://github.com/docker-scripts/bind9) for managing my domains, so I just paste it on `example.org.db`:
+        It would look something like this:
+
+        ```txt
+        $ORIGIN example.com
+        @     IN  A      10.11.12.13
+        mail  IN  A      10.11.12.13
+
+        ; mail server for example.com
+        @     IN  MX  10 mail.example.com.
+
+        ; Add SPF record
+        @     IN  TXT    "v=spf1 mx -all"
+        ```
+
+        Then don't forget to change the `SOA` serial number, and to restart the service.
+
+3. [Generate DKIM keys][docs-dkim] for your domain via `setup config dkim`.
+
+    Copy the content of the file `docker-data/dms/config/opendkim/keys/example.com/mail.txt` and add it to your DNS records as a TXT like SPF was handled above.
+
+    I use [bind9](https://github.com/docker-scripts/bind9) for managing my domains, so I just paste it on `example.com.db`:
 
     ```txt
     mail._domainkey IN      TXT     ( "v=DKIM1; h=sha256; k=rsa; "
             "p=MIIBIjANBgkqhkiG9w0BAQEFACAQ8AMIIBCgKCAQEAaH5KuPYPSF3Ppkt466BDMAFGOA4mgqn4oPjZ5BbFlYA9l5jU3bgzRj3l6/Q1n5a9lQs5fNZ7A/HtY0aMvs3nGE4oi+LTejt1jblMhV/OfJyRCunQBIGp0s8G9kIUBzyKJpDayk2+KJSJt/lxL9Iiy0DE5hIv62ZPP6AaTdHBAsJosLFeAzuLFHQ6USyQRojefqFQtgYqWQ2JiZQ3"
-            "iqq3bD/BVlwKRp5gH6TEYEmx8EBJUuDxrJhkWRUk2VDl1fqhVBy8A9O7Ah+85nMrlOHIFsTaYo9o6+cDJ6t1i6G1gu+bZD0d3/3bqGLPBQV9LyEL1Rona5V7TJBGg099NQkTz1IwIDAQAB" )  ; ----- DKIM key mail for example.org
+            "iqq3bD/BVlwKRp5gH6TEYEmx8EBJUuDxrJhkWRUk2VDl1fqhVBy8A9O7Ah+85nMrlOHIFsTaYo9o6+cDJ6t1i6G1gu+bZD0d3/3bqGLPBQV9LyEL1Rona5V7TJBGg099NQkTz1IwIDAQAB" )  ; ----- DKIM key mail for example.com
     ```
 
-- Add these configurations as well on the same file on the DNS server:
+4. Get an SSL certificate, [we have a guide for you here][docs-ssl] (_Let's Encrypt_ is a popular service to get free SSL certificates).
 
-    ```txt
-    mail      IN  A   10.11.12.13
+5. Start DMS and check the terminal output for any errors: `docker compose up`.
 
-    ; mailservers for example.org
-        3600  IN  MX  1  mail.example.org.
+6. Create email accounts and aliases:
 
-    ; Add SPF record
-              IN TXT "v=spf1 mx ~all"
-    ```
+    !!! example "With `SPOOF_PROTECTION=0`"
 
-    Then don't forget to change the serial number and to restart the service.
+        ```sh
+        setup email add admin@example.com passwd123
+        setup email add info@example.com passwd123
+        setup alias add admin@example.com external-account@gmail.com
+        setup alias add info@example.com external-account@gmail.com
+        setup email list
+        setup alias list
+        ```
 
-- Get an SSL certificate from letsencrypt. I use [wsproxy](https://gitlab.com/docker-scripts/wsproxy) for managing SSL letsencrypt certificates of my domains:
+        Aliases make sure that any email that comes to these accounts is forwarded to your third-party email address (`external-account@gmail.com`), where they are retrieved (_eg: via third-party web or mobile app_), instead of connecting directly to `docker-mailserer` with POP3 / IMAP.
 
-    ```sh
-    cd /var/ds/wsproxy
-    ds domains-add mail mail.example.org
-    ds get-ssl-cert myemail@gmail.com mail.example.org --test
-    ds get-ssl-cert myemail@gmail.com mail.example.org
-    ```
+    !!! example "With `SPOOF_PROTECTION=1`"
 
-    Now the certificates will be available on `/var/ds/wsproxy/letsencrypt/live/mail.example.org`.
+        ```sh
+        setup email add admin.gmail@example.com passwd123
+        setup email add info.gmail@example.com passwd123
+        setup alias add admin@example.com admin.gmail@example.com
+        setup alias add info@example.com info.gmail@example.com
+        setup alias add admin.gmail@example.com external-account@gmail.com
+        setup alias add info.gmail@example.com external-account@gmail.com
+        setup email list
+        setup alias list
+        ```
 
-- Start the mailserver and check for any errors:
+        This extra step is required to avoid the `553 5.7.1 Sender address rejected: not owned by user` error (_the accounts used for submitting mail to Gmail are `admin.gmail@example.com` and `info.gmail@example.com`_)
 
-    ```sh
-    apt install docker-compose
-    docker-compose up mail
-    ```
+7. Send some test emails to these addresses and make other tests. Once everything is working well, stop the container with `ctrl+c` and start it again as a daemon: `docker compose up -d`.
 
-- Create email accounts and aliases with `SPOOF_PROTECTION=0`:
-
-    ```sh
-    ./setup.sh email add admin@example.org passwd123
-    ./setup.sh email add info@example.org passwd123
-    ./setup.sh alias add admin@example.org myemail@gmail.com
-    ./setup.sh alias add info@example.org myemail@gmail.com
-    ./setup.sh email list
-    ./setup.sh alias list
-    ```
-
-    Aliases make sure that any email that comes to these accounts is forwarded to my real email address, so that I don't need to use POP3/IMAP in order to get these messages. Also no anti-spam and anti-virus software is needed, making the mailserver lighter.
-
-- Or create email accounts and aliases with `SPOOF_PROTECTION=1`:
-
-    ```sh
-    ./setup.sh email add admin.gmail@example.org passwd123
-    ./setup.sh email add info.gmail@example.org passwd123
-    ./setup.sh alias add admin@example.org admin.gmail@example.org
-    ./setup.sh alias add info@example.org info.gmail@example.org
-    ./setup.sh alias add admin.gmail@example.org myemail@gmail.com
-    ./setup.sh alias add info.gmail@example.org myemail@gmail.com
-    ./setup.sh email list
-    ./setup.sh alias list
-    ```
-
-    This extra step is required to avoid the `553 5.7.1 Sender address rejected: not owned by user` error (the account used for setting up Gmail is `admin.gmail@example.org` and `info.gmail@example.org` )
-
-- Send some test emails to these addresses and make other tests. Then stop the container with `ctrl+c` and start it again as a daemon: `docker-compose up -d mail`.
-
-- Now save on Moodle configuration the SMTP settings and test by trying to send some messages to other users:
-
-    - **SMTP hosts**: `mail.example.org:465`
-    - **SMTP security**: `SSL`
-    - **SMTP username**: `info@example.org`
-    - **SMTP password**: `passwd123`
-
+[docs-ports]: ../../config/security/understanding-the-ports.md
 [docs-environment]: ../../config/environment.md
-[github-file-dotenv]: https://github.com/docker-mailserver/docker-mailserver/blob/master/mailserver.env
+[docs-spf]: ../../config/best-practices/dkim_dmarc_spf.md#spf
+[docs-dkim]: ../../config/best-practices/dkim_dmarc_spf.md#dkim
+[docs-ssl]: ../../config/security/ssl.md#lets-encrypt-recommended
+[docs-usage]: ../../usage.md#get-up-and-running
+[github-issue-ufw]: https://github.com/docker-mailserver/docker-mailserver/issues/3151
 [github-issue-1405-comment]: https://github.com/docker-mailserver/docker-mailserver/issues/1405#issuecomment-590106498
