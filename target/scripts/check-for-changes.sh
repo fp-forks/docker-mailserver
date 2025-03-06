@@ -1,244 +1,217 @@
-#! /bin/bash
+#!/bin/bash
 
-# shellcheck source=./helper-functions.sh
-. /usr/local/bin/helper-functions.sh
+# TODO: Adapt for compatibility with LDAP
+# Only the cert renewal change detection may be relevant for LDAP?
 
-LOG_DATE=$(date +"%Y-%m-%d %H:%M:%S ")
-_notify 'task' "${LOG_DATE} Start check-for-changes script."
+# CHKSUM_FILE global is imported from this file:
+# shellcheck source=./helpers/index.sh
+source /usr/local/bin/helpers/index.sh
 
-SCRIPT_NAME="$(basename "$0")"
+_log 'debug' 'Starting changedetector'
 
-# ? ––––––––––––––––––––––––––––––––––––––––––––– Checks
+# ATTENTION: Do not remove!
+# This script requires some environment variables to be properly set.
+# POSTMASTER_ADDRESS (for helpers/alias.sh) is read from /etc/dms-settings
+# shellcheck source=/dev/null
+source /etc/dms-settings
 
-cd /tmp/docker-mailserver || exit 1
+# HOSTNAME and DOMAINNAME are used by helpers/ssl.sh and _monitored_files_checksums
+# These are not stored in /etc/dms-settings
+# TODO: It is planned to stop overriding HOSTNAME and replace that
+# usage with DMS_HOSTNAME, which should remove the need to call this:
+_obtain_hostname_and_domainname
 
-# check postfix-accounts.cf exist else break
-if [[ ! -f postfix-accounts.cf ]]
-then
-  _notify 'inf' "${LOG_DATE} postfix-accounts.cf is missing! This should not run! Exit!"
-  exit 0
-fi
+# This is a helper to properly set all Rspamd-related environment variables
+# correctly and in one place.
+_rspamd_get_envs
 
 # verify checksum file exists; must be prepared by start-mailserver.sh
-if [[ ! -f ${CHKSUM_FILE} ]]
-then
-  _notify 'err' "${LOG_DATE} ${CHKSUM_FILE} is missing! Start script failed? Exit!"
-  exit 0
+if [[ ! -f ${CHKSUM_FILE} ]]; then
+  _exit_with_error "'${CHKSUM_FILE}' is missing" 0
 fi
 
-# ? --------------------------------------------- Actual script begins
+_log 'trace' "Using postmaster address '${POSTMASTER_ADDRESS}'"
 
-# determine postmaster address, duplicated from start-mailserver.sh
-# this script previously didn't work when POSTMASTER_ADDRESS was empty
-if [[ -n ${OVERRIDE_HOSTNAME} ]]
-then
-  DOMAINNAME="${OVERRIDE_HOSTNAME#*.}"
-else
-  DOMAINNAME="$(hostname -d)"
-fi
+_log 'debug' "Changedetector is ready"
 
-PM_ADDRESS="${POSTMASTER_ADDRESS:=postmaster@${DOMAINNAME}}"
-_notify 'inf' "${LOG_DATE} Using postmaster address ${PM_ADDRESS}"
-sleep 10
-
-while true
-do
-  LOG_DATE=$(date +"%Y-%m-%d %H:%M:%S ")
-
-  # Lock configuration while working
-  create_lock "${SCRIPT_NAME}"
-
+function _check_for_changes() {
   # get chksum and check it, no need to lock config yet
   _monitored_files_checksums >"${CHKSUM_FILE}.new"
   cmp --silent -- "${CHKSUM_FILE}" "${CHKSUM_FILE}.new"
+
   # cmp return codes
   # 0 – files are identical
   # 1 – files differ
   # 2 – inaccessible or missing argument
-  if [ $? -eq 1 ]
-  then
-    _notify 'inf' "${LOG_DATE} Change detected"
-    CHANGED=$(grep -Fxvf "${CHKSUM_FILE}" "${CHKSUM_FILE}.new" | sed 's/^[^ ]\+  //')
+  if [[ ${?} -eq 1 ]]; then
+    _log 'info' 'Change detected'
+    _create_lock # Shared config safety lock
 
-    # Bug alert! This overwrites the alias set by start-mailserver.sh
-    # Take care that changes in one script are propagated to the other
+    local CHANGED
+    CHANGED=$(_get_changed_files "${CHKSUM_FILE}" "${CHKSUM_FILE}.new")
+    _handle_changes
 
-    # ! NEEDS FIX -----------------------------------------
-    # TODO FIX --------------------------------------------
-    # ! NEEDS EXTENSIONS ----------------------------------
-    # TODO Perform updates below conditionally too --------
-    # Also note that changes are performed in place and are not atomic
-    # We should fix that and write to temporary files, stop, swap and start
+    _remove_lock
+    _log 'debug' 'Completed handling of detected change'
 
-    for FILE in ${CHANGED}
-    do
-      case "${FILE}" in
-        "/etc/letsencrypt/acme.json" )
-          for CERTDOMAIN in ${SSL_DOMAIN} ${HOSTNAME} ${DOMAINNAME}
-          do
-            _extract_certs_from_acme "${CERTDOMAIN}" && break
-          done
-          ;;
+    # mark changes as applied
+    mv "${CHKSUM_FILE}.new" "${CHKSUM_FILE}"
+  fi
+}
 
-        * )
-          _notify 'warn' 'File not found for certificate in check_for_changes.sh'
-          ;;
+function _handle_changes() {
+  # Variable to identify any config updates dependent upon vhost changes.
+  local VHOST_UPDATED=0
+  # These two configs are the source for /etc/postfix/vhost (managed mail domains)
+  if [[ ${CHANGED} =~ ${DMS_DIR}/postfix-(accounts|virtual).cf ]]; then
+    _log 'trace' 'Regenerating vhosts (Postfix)'
+    # Regenerate via `helpers/postfix.sh`:
+    _create_postfix_vhost
 
-      esac
-    done
-
-    # regenerate postix aliases
-    echo "root: ${PM_ADDRESS}" >/etc/aliases
-    if [[ -f /tmp/docker-mailserver/postfix-aliases.cf ]]
-    then
-      cat /tmp/docker-mailserver/postfix-aliases.cf >>/etc/aliases
-    fi
-    postalias /etc/aliases
-
-    # regenerate postfix accounts
-    : >/etc/postfix/vmailbox
-    : >/etc/dovecot/userdb
-
-    if [[ -f /tmp/docker-mailserver/postfix-accounts.cf ]] && [[ ${ENABLE_LDAP} -ne 1 ]]
-    then
-      sed -i 's/\r//g' /tmp/docker-mailserver/postfix-accounts.cf
-      echo "# WARNING: this file is auto-generated. Modify config/postfix-accounts.cf to edit user list." >/etc/postfix/vmailbox
-
-      # Checking that /tmp/docker-mailserver/postfix-accounts.cf ends with a newline
-      # shellcheck disable=SC1003
-      sed -i -e '$a\' /tmp/docker-mailserver/postfix-accounts.cf
-      chown dovecot:dovecot /etc/dovecot/userdb
-      chmod 640 /etc/dovecot/userdb
-      sed -i -e '/\!include auth-ldap\.conf\.ext/s/^/#/' /etc/dovecot/conf.d/10-auth.conf
-      sed -i -e '/\!include auth-passwdfile\.inc/s/^#//' /etc/dovecot/conf.d/10-auth.conf
-
-      # rebuild relay host
-      if [[ -n ${RELAY_HOST} ]]
-      then
-        # keep old config
-        : >/etc/postfix/sasl_passwd
-        if [[ -n ${SASL_PASSWD} ]]
-        then
-          echo "${SASL_PASSWD}" >>/etc/postfix/sasl_passwd
-        fi
-
-        # add domain-specific auth from config file
-        if [[ -f /tmp/docker-mailserver/postfix-sasl-password.cf ]]
-        then
-          while read -r LINE
-          do
-            if ! grep -q -e "\s*#" <<< "${LINE}"
-            then
-              echo "${LINE}" >>/etc/postfix/sasl_passwd
-            fi
-          done < <(grep -v "^\s*$\|^\s*\#" /tmp/docker-mailserver/postfix-sasl-password.cf || true)
-        fi
-
-        # add default relay
-        if [[ -n "${RELAY_USER}" ]] && [[ -n "${RELAY_PASSWORD}" ]]
-        then
-          echo "[${RELAY_HOST}]:${RELAY_PORT}		${RELAY_USER}:${RELAY_PASSWORD}" >>/etc/postfix/sasl_passwd
-        fi
-      fi
-
-      # creating users ; 'pass' is encrypted
-      # comments and empty lines are ignored
-      while IFS=$'|' read -r LOGIN PASS USER_ATTRIBUTES
-      do
-        USER=$(echo "${LOGIN}" | cut -d @ -f1)
-        DOMAIN=$(echo "${LOGIN}" | cut -d @ -f2)
-
-        # test if user has a defined quota
-        if [[ -f /tmp/docker-mailserver/dovecot-quotas.cf ]]
-        then
-          declare -a USER_QUOTA
-          IFS=':' ; read -r -a USER_QUOTA < <(grep "${USER}@${DOMAIN}:" -i /tmp/docker-mailserver/dovecot-quotas.cf)
-          unset IFS
-
-          [[ ${#USER_QUOTA[@]} -eq 2 ]] && USER_ATTRIBUTES="${USER_ATTRIBUTES} userdb_quota_rule=*:bytes=${USER_QUOTA[1]}"
-        fi
-
-        echo "${LOGIN} ${DOMAIN}/${USER}/" >>/etc/postfix/vmailbox
-
-        # user database for dovecot has the following format:
-        # user:password:uid:gid:(gecos):home:(shell):extra_fields
-        # example :
-        # ${LOGIN}:${PASS}:5000:5000::/var/mail/${DOMAIN}/${USER}::userdb_mail=maildir:/var/mail/${DOMAIN}/${USER}
-        echo "${LOGIN}:${PASS}:5000:5000::/var/mail/${DOMAIN}/${USER}::${USER_ATTRIBUTES}" >>/etc/dovecot/userdb
-        mkdir -p "/var/mail/${DOMAIN}/${USER}"
-
-        if [[ -e /tmp/docker-mailserver/${LOGIN}.dovecot.sieve ]]
-        then
-          cp "/tmp/docker-mailserver/${LOGIN}.dovecot.sieve" "/var/mail/${DOMAIN}/${USER}/.dovecot.sieve"
-        fi
-
-        echo "${DOMAIN}" >>/tmp/vhost.tmp
-      done < <(grep -v "^\s*$\|^\s*\#" /tmp/docker-mailserver/postfix-accounts.cf)
-    fi
-
-    [[ -n ${RELAY_HOST} ]] && _populate_relayhost_map
-
-
-    if [[ -f /etc/postfix/sasl_passwd ]]
-    then
-      chown root:root /etc/postfix/sasl_passwd
-      chmod 0600 /etc/postfix/sasl_passwd
-    fi
-
-    if [[ -f postfix-virtual.cf ]]
-    then
-      # regenerate postfix aliases
-      : >/etc/postfix/virtual
-      : >/etc/postfix/regexp
-
-      if [[ -f /tmp/docker-mailserver/postfix-virtual.cf ]]
-      then
-        cp -f /tmp/docker-mailserver/postfix-virtual.cf /etc/postfix/virtual
-
-        # the `to` seems to be important; don't delete it
-        # shellcheck disable=SC2034
-        while read -r FROM TO
-        do
-          UNAME=$(echo "${FROM}" | cut -d @ -f1)
-          DOMAIN=$(echo "${FROM}" | cut -d @ -f2)
-
-          # if they are equal it means the line looks like: "user1	 other@domain.tld"
-          [ "${UNAME}" != "${DOMAIN}" ] && echo "${DOMAIN}" >>/tmp/vhost.tmp
-        done  < <(grep -v "^\s*$\|^\s*\#" /tmp/docker-mailserver/postfix-virtual.cf || true)
-      fi
-
-      if [[ -f /tmp/docker-mailserver/postfix-regexp.cf ]]
-      then
-        cp -f /tmp/docker-mailserver/postfix-regexp.cf /etc/postfix/regexp
-        sed -i -e '/^virtual_alias_maps/{
-s/ regexp:.*//
-s/$/ regexp:\/etc\/postfix\/regexp/
-}' /etc/postfix/main.cf
-      fi
-    fi
-
-    if [[ -f /tmp/vhost.tmp ]]
-    then
-      sort < /tmp/vhost.tmp | uniq >/etc/postfix/vhost
-      rm /tmp/vhost.tmp
-    fi
-
-    if find /var/mail -maxdepth 3 -a \( \! -user 5000 -o \! -group 5000 \) | read -r
-    then
-      chown -R 5000:5000 /var/mail
-    fi
-
-    supervisorctl restart postfix
-
-    # prevent restart of dovecot when smtp_only=1
-    [[ ${SMTP_ONLY} -ne 1 ]] && supervisorctl restart dovecot
+    VHOST_UPDATED=1
   fi
 
-  # mark changes as applied
-  mv "${CHKSUM_FILE}.new" "${CHKSUM_FILE}"
-  remove_lock "${SCRIPT_NAME}"
+  _ssl_changes
+  _postfix_dovecot_changes
+  _rspamd_changes
 
-  sleep 1
+  _log 'debug' 'Reloading services due to detected changes'
+
+  [[ ${ENABLE_AMAVIS} -eq 1 ]] && _reload_amavis
+  _reload_postfix
+  [[ ${SMTP_ONLY} -ne 1 ]] && dovecot reload
+}
+
+function _get_changed_files() {
+  local CHKSUM_CURRENT=${1}
+  local CHKSUM_NEW=${2}
+
+  # Diff the two files for lines that don't match or differ from lines in CHKSUM_FILE
+  # grep -Fxvf
+  #   -f use CHKSUM_FILE lines as input patterns to match for
+  #   -F The patterns to match are treated as strings only, not treated as regex syntax
+  #   -x (match whole lines only)
+  #   -v invert the matching so only non-matches are output
+  # Extract file paths by truncating the matched content hash and white-space from lines:
+  # sed -r 's/^\S+[[:space:]]+//'
+  grep -Fxvf "${CHKSUM_CURRENT}" "${CHKSUM_NEW}" | sed -r 's/^\S+[[:space:]]+//'
+}
+
+function _reload_amavis() {
+  # /etc/postfix/vhost was updated, amavis must refresh it's config by
+  # reading this file again in case of new domains, otherwise they will be ignored.
+  if [[ ${VHOST_UPDATED} -eq 1 ]]; then
+    amavisd reload
+  fi
+}
+
+# Also note that changes are performed in place and are not atomic
+# We should fix that and write to temporary files, stop, swap and start
+function _postfix_dovecot_changes() {
+  local DMS_DIR=/tmp/docker-mailserver
+
+  # Regenerate accounts via `helpers/accounts.sh`:
+  # - dovecot-quotas.cf used by _create_accounts + _create_dovecot_alias_dummy_accounts
+  # - postfix-virtual.cf used by _create_dovecot_alias_dummy_accounts (only when ENABLE_QUOTAS=1)
+  if [[ ${CHANGED} =~ ${DMS_DIR}/postfix-accounts.cf ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/postfix-virtual.cf  ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/postfix-aliases.cf  ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/dovecot-quotas.cf   ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/dovecot-masters.cf  ]]
+  then
+    _log 'trace' 'Regenerating accounts (Dovecot + Postfix)'
+    [[ ${SMTP_ONLY} -ne 1 ]] && _create_accounts
+  fi
+
+  # Regenerate relay config via `helpers/relay.sh`:
+  # - postfix-sasl-password.cf used by _relayhost_sasl
+  # - _populate_relayhost_map relies on:
+  #   - postfix-relaymap.cf
+  if [[ ${VHOST_UPDATED} -eq 1 ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/postfix-relaymap.cf      ]] \
+  || [[ ${CHANGED} =~ ${DMS_DIR}/postfix-sasl-password.cf ]]
+  then
+    _log 'trace' 'Regenerating relay config (Postfix)'
+    _process_relayhost_configs
+  fi
+
+  # Regenerate system + virtual account aliases via `helpers/aliases.sh`:
+  [[ ${CHANGED} =~ ${DMS_DIR}/postfix-virtual.cf ]] && _handle_postfix_virtual_config
+  [[ ${CHANGED} =~ ${DMS_DIR}/postfix-regexp.cf  ]] && _handle_postfix_regexp_config
+  [[ ${CHANGED} =~ ${DMS_DIR}/postfix-aliases.cf ]] && _handle_postfix_aliases_config
+
+  # Legacy workaround handled here, only seems necessary for _create_accounts:
+  # - `helpers/accounts.sh` logic creates folders/files with wrong ownership.
+  _chown_var_mail_if_necessary
+}
+
+function _ssl_changes() {
+  local REGEX_NEVER_MATCH='(?\!)'
+
+  # _setup_ssl is required for:
+  # manual - copy to internal DMS_TLS_PATH (/etc/dms/tls) that Postfix and Dovecot are configured to use.
+  # acme.json - presently uses /etc/letsencrypt/live/<FQDN> instead of DMS_TLS_PATH,
+  # path may change requiring Postfix/Dovecot config update.
+  if [[ ${SSL_TYPE} == 'manual' ]]; then
+    # only run the SSL setup again if certificates have really changed.
+    if [[ ${CHANGED} =~ ${SSL_CERT_PATH:-${REGEX_NEVER_MATCH}} ]]     \
+    || [[ ${CHANGED} =~ ${SSL_KEY_PATH:-${REGEX_NEVER_MATCH}} ]]      \
+    || [[ ${CHANGED} =~ ${SSL_ALT_CERT_PATH:-${REGEX_NEVER_MATCH}} ]] \
+    || [[ ${CHANGED} =~ ${SSL_ALT_KEY_PATH:-${REGEX_NEVER_MATCH}} ]]
+    then
+      _log 'debug' 'Manual certificates have changed - extracting certificates'
+      _setup_ssl
+    fi
+  # `acme.json` is only relevant to Traefik, and is where it stores the certificates it manages.
+  # When a change is detected it's assumed to be a possible cert renewal that needs to be
+  # extracted for `docker-mailserver` services to adjust to.
+  elif [[ ${CHANGED} =~ /etc/letsencrypt/acme.json ]]; then
+    _log 'debug' "'/etc/letsencrypt/acme.json' has changed - extracting certificates"
+    _setup_ssl
+
+    # Prevent an unnecessary change detection from the newly extracted cert files by updating their hashes in advance:
+    local CERT_DOMAIN ACME_CERT_DIR
+    CERT_DOMAIN=$(_find_letsencrypt_domain)
+    ACME_CERT_DIR="/etc/letsencrypt/live/${CERT_DOMAIN}"
+
+    sed -i "\|${ACME_CERT_DIR}|d" "${CHKSUM_FILE}.new"
+    sha512sum "${ACME_CERT_DIR}"/*.pem >> "${CHKSUM_FILE}.new"
+  fi
+
+  # If monitored certificate files in /etc/letsencrypt/live have changed and no `acme.json` is in use,
+  # They presently have no special handling other than to trigger a change that will restart Postfix/Dovecot.
+}
+
+function _rspamd_changes() {
+  # RSPAMD_DMS_D='/tmp/docker-mailserver/rspamd'
+  if [[ ${CHANGED} =~ ${RSPAMD_DMS_D}/.* ]]; then
+
+    # "${RSPAMD_DMS_D}/override.d"
+    if [[ ${CHANGED} =~ ${RSPAMD_DMS_OVERRIDE_D}/.* ]]; then
+      _log 'trace' 'Rspamd - Copying configuration overrides'
+      rm "${RSPAMD_OVERRIDE_D}"/*
+      cp "${RSPAMD_DMS_OVERRIDE_D}"/* "${RSPAMD_OVERRIDE_D}"
+    fi
+
+    # "${RSPAMD_DMS_D}/custom-commands.conf"
+    if [[ ${CHANGED} =~ ${RSPAMD_DMS_CUSTOM_COMMANDS_F} ]]; then
+      _log 'trace' 'Rspamd - Generating new configuration from custom commands'
+      _rspamd_handle_user_modules_adjustments
+    fi
+
+    # "${RSPAMD_DMS_D}/dkim"
+    if [[ ${CHANGED} =~ ${RSPAMD_DMS_DKIM_D} ]]; then
+      _log 'trace' 'Rspamd - DKIM files updated'
+    fi
+
+    _log 'debug' 'Rspamd configuration has changed - restarting service'
+    supervisorctl restart rspamd
+  fi
+}
+
+while true; do
+  _check_for_changes
+  sleep 2
 done
 
 exit 0
